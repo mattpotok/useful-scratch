@@ -18,7 +18,6 @@ const GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.send"];
 const PROJECT_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const GMAIL_CREDENTIALS_PATH = join(PROJECT_ROOT, "credentials.json");
 const GMAIL_TOKEN_PATH = join(PROJECT_ROOT, "token.json");
-const TEST_BILL_PDF_PATH = "/tmp/verizon-bill-Yo8USG/latest-bill.pdf";
 
 type InstalledCredentials = {
   installed: {
@@ -33,9 +32,7 @@ type DeliveryMethod = "slack" | "email";
 function parseCliArgs(): { delivery: DeliveryMethod } {
   const program = new Command();
 
-  program
-    .name("verizon-runner")
-    .description("Download the latest Verizon bill and deliver it.");
+  program.name("verizon-runner").description("Download the latest Verizon bill and deliver it.");
 
   program.addOption(
     new Option("--delivery <method>", "delivery method")
@@ -70,6 +67,14 @@ function getPasswordOptionButton(page: Page): Locator {
   return page.getByRole("button", { name: /^(Sign in with password|Password)$/ });
 }
 
+function getErrorMessage(error: unknown): string {
+  if (error instanceof Error) {
+    return `${error.name}: ${error.message}\n${error.stack ?? ""}`.trim();
+  }
+
+  return String(error);
+}
+
 async function submitPassword(page: Page, password: string): Promise<void> {
   await page.locator("#password").waitFor({ state: "visible" });
   await page.locator("#password").fill(password);
@@ -81,6 +86,7 @@ async function submitPassword(page: Page, password: string): Promise<void> {
 async function completePasswordOnlyFlow(page: Page, password: string): Promise<void> {
   const passwordOptionButton = getPasswordOptionButton(page);
 
+  // Some sessions show a method picker before the password form.
   await passwordOptionButton.waitFor({ state: "visible" });
   await passwordOptionButton.click();
   await submitPassword(page, password);
@@ -96,6 +102,7 @@ async function completeVerificationFlow(page: Page, password: string): Promise<v
   const countdownHeading = page.getByText("We sent you an authorization request.");
   const expiredBanner = page.getByText("The authentication request has expired.");
 
+  // This path submits a password first, then waits for phone authorization.
   await submitPassword(page, password);
   await rememberVerificationRadio.waitFor({ state: "visible" });
   await rememberVerificationRadio.check();
@@ -108,9 +115,7 @@ async function completeVerificationFlow(page: Page, password: string): Promise<v
       .getByRole("heading", { name: /^Hi,/ })
       .waitFor({ state: "visible", timeout: 180000 })
       .then(() => "dashboard" as const),
-    expiredBanner
-      .waitFor({ state: "visible", timeout: 180000 })
-      .then(() => "expired" as const)
+    expiredBanner.waitFor({ state: "visible", timeout: 180000 }).then(() => "expired" as const)
   ]);
 
   if (loginResult === "expired") {
@@ -130,6 +135,7 @@ async function downloadLatestBill(page: Page): Promise<string> {
   await reviewBillPdfButton.waitFor({ state: "visible" });
   await reviewBillPdfButton.click();
 
+  // Verizon opens the PDF in a popup; fetch that URL with the same authenticated context.
   const popupPromise = page.context().waitForEvent("page", { timeout: 10000 });
   const popupPage = await popupPromise;
   await popupPage.waitForLoadState("domcontentloaded");
@@ -163,7 +169,7 @@ async function getGmailAuthClient() {
   );
 
   const existingToken = await readFile(GMAIL_TOKEN_PATH, "utf8")
-    .then(token => JSON.parse(token))
+    .then((token) => JSON.parse(token))
     .catch(() => null);
 
   if (existingToken) {
@@ -171,6 +177,7 @@ async function getGmailAuthClient() {
     return authClient;
   }
 
+  // First Gmail run requires interactive OAuth; future runs reuse token.json.
   const authUrl = authClient.generateAuthUrl({
     access_type: "offline",
     scope: GMAIL_SCOPES
@@ -225,6 +232,28 @@ async function sendBillEmail(pdfPath: string, recipient: string): Promise<void> 
   console.log(`Latest bill emailed to: ${recipient}`);
 }
 
+async function sendErrorEmail(error: unknown, recipient: string): Promise<void> {
+  const auth = await getGmailAuthClient();
+  const gmail = google.gmail({ version: "v1", auth });
+  const message = [
+    `To: ${recipient}`,
+    "Subject: Verizon bill runner failed",
+    "MIME-Version: 1.0",
+    "Content-Type: text/plain; charset=utf-8",
+    "",
+    getErrorMessage(error)
+  ].join("\r\n");
+
+  await gmail.users.messages.send({
+    userId: "me",
+    requestBody: {
+      raw: base64UrlEncode(message)
+    }
+  });
+
+  console.log(`Failure notification emailed to: ${recipient}`);
+}
+
 async function uploadBillToSlack(pdfPath: string): Promise<void> {
   const slackToken = getRequiredEnvVar("SLACK_BOT_TOKEN");
   const slackChannelId = getRequiredEnvVar("SLACK_CHANNEL_ID");
@@ -242,11 +271,32 @@ async function uploadBillToSlack(pdfPath: string): Promise<void> {
   console.log(`Latest bill uploaded to Slack channel: ${slackChannelId}`);
 }
 
+async function sendErrorToSlack(error: unknown): Promise<void> {
+  const slackToken = getRequiredEnvVar("SLACK_BOT_TOKEN");
+  const slackChannelId = getRequiredEnvVar("SLACK_CHANNEL_ID");
+  const slack = new WebClient(slackToken);
+
+  await slack.chat.postMessage({
+    channel: slackChannelId,
+    text: `Verizon bill runner failed:\n\`\`\`${getErrorMessage(error)}\`\`\``
+  });
+
+  console.log(`Failure notification sent to Slack channel: ${slackChannelId}`);
+}
+
 async function deliverBill(pdfPath: string, delivery: DeliveryMethod): Promise<void> {
   if (delivery === "slack") {
     await uploadBillToSlack(pdfPath);
   } else {
     await sendBillEmail(pdfPath, getRequiredEnvVar("EMAIL_TO"));
+  }
+}
+
+async function deliverError(error: unknown, delivery: DeliveryMethod): Promise<void> {
+  if (delivery === "slack") {
+    await sendErrorToSlack(error);
+  } else {
+    await sendErrorEmail(error, getRequiredEnvVar("EMAIL_TO"));
   }
 }
 
@@ -260,15 +310,14 @@ async function login(page: Page, username: string, password: string): Promise<vo
   await expect(continueButton).toBeEnabled();
   await continueButton.click();
 
+  // After username submission Verizon chooses one of two login experiences.
   const passwordOptionButton = getPasswordOptionButton(page);
   const passwordField = page.locator("#password");
   const nextStep = await Promise.race([
     passwordOptionButton
       .waitFor({ state: "visible", timeout: 10000 })
       .then(() => "password-only" as const),
-    passwordField
-      .waitFor({ state: "visible", timeout: 10000 })
-      .then(() => "verification" as const)
+    passwordField.waitFor({ state: "visible", timeout: 10000 }).then(() => "verification" as const)
   ]).catch(() => null);
 
   if (nextStep === "password-only") {
@@ -287,17 +336,24 @@ async function main(): Promise<void> {
   const password = getRequiredEnvVar("VERIZON_PASSWORD");
   const browser = await chromium.launch({ headless: true });
   const page = await browser.newPage();
+  let failure: unknown;
 
   try {
     await login(page, username, password);
     const pdfPath = await downloadLatestBill(page);
     await deliverBill(pdfPath, delivery);
+  } catch (error) {
+    // Notify through the selected delivery method, then rethrow for cron/log visibility.
+    failure = error;
+    await deliverError(error, delivery);
   } finally {
     await page.waitForTimeout(3000);
     await browser.close();
   }
 
-  // await deliverBill(TEST_BILL_PDF_PATH, delivery);
+  if (failure) {
+    throw failure;
+  }
 }
 
 await main();
