@@ -6,7 +6,6 @@ import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { expect } from "@playwright/test";
 import { WebClient } from "@slack/web-api";
 import { Command, Option } from "commander";
 import { OAuth2Client } from "google-auth-library";
@@ -69,18 +68,59 @@ function getPasswordOptionButton(page: Page): Locator {
 
 function getErrorMessage(error: unknown): string {
   if (error instanceof Error) {
-    return `${error.name}: ${error.message}\n${error.stack ?? ""}`.trim();
+    return error.stack ?? `${error.name}: ${error.message}`;
   }
 
   return String(error);
 }
 
+function addErrorContext(error: unknown, context: string): Error {
+  const contextualError = new Error(error instanceof Error ? error.message : String(error));
+
+  if (error instanceof Error) {
+    contextualError.name = error.name;
+    contextualError.stack = `${getErrorMessage(error)}\n\n${context}`;
+  } else if (contextualError.stack) {
+    contextualError.stack = `${contextualError.stack}\n\n${context}`;
+  }
+
+  return contextualError;
+}
+
+async function savePageDiagnostics(page: Page, label: string): Promise<string> {
+  const diagnosticsBaseDirectory = process.env.VERIZON_DEBUG_DIR ?? tmpdir();
+  const diagnosticsDirectory = await mkdtemp(join(diagnosticsBaseDirectory, "verizon-debug-"));
+  const screenshotPath = join(diagnosticsDirectory, `${label}.png`);
+  const htmlPath = join(diagnosticsDirectory, `${label}.html`);
+  const title = await page.title().catch(() => "Unable to read page title");
+
+  await page.screenshot({ path: screenshotPath, fullPage: true }).catch(() => undefined);
+  await writeFile(htmlPath, await page.content(), "utf8").catch(() => undefined);
+
+  return [
+    `Diagnostics saved to: ${diagnosticsDirectory}`,
+    `Current URL: ${page.url()}`,
+    `Page title: ${title}`,
+    `Screenshot: ${screenshotPath}`,
+    `HTML: ${htmlPath}`
+  ].join("\n");
+}
+
+async function openSignInPage(page: Page): Promise<Locator> {
+  await page.goto("https://secure.verizon.com/signin", {
+    waitUntil: "domcontentloaded",
+    timeout: 60000
+  });
+
+  const usernameField = page.locator("#username");
+  await usernameField.waitFor({ state: "visible", timeout: 45000 });
+  return usernameField;
+}
+
 async function submitPassword(page: Page, password: string): Promise<void> {
   await page.locator("#password").waitFor({ state: "visible" });
   await page.locator("#password").fill(password);
-  const signInButton = page.locator("#mvo-main-button");
-  await expect(signInButton).toBeEnabled();
-  await signInButton.click();
+  await page.locator("#mvo-main-button").click();
 }
 
 async function completePasswordOnlyFlow(page: Page, password: string): Promise<void> {
@@ -301,14 +341,10 @@ async function deliverError(error: unknown, delivery: DeliveryMethod): Promise<v
 }
 
 async function login(page: Page, username: string, password: string): Promise<void> {
-  await page.goto("https://secure.verizon.com/signin", {
-    waitUntil: "domcontentloaded"
-  });
+  const usernameField = await openSignInPage(page);
 
-  await page.locator("#username").fill(username);
-  const continueButton = page.locator("#mvo-main-button");
-  await expect(continueButton).toBeEnabled();
-  await continueButton.click();
+  await usernameField.fill(username);
+  await page.locator("#mvo-main-button").click();
 
   // After username submission Verizon chooses one of two login experiences.
   const passwordOptionButton = getPasswordOptionButton(page);
@@ -334,8 +370,11 @@ async function main(): Promise<void> {
 
   const username = getRequiredEnvVar("VERIZON_USERNAME");
   const password = getRequiredEnvVar("VERIZON_PASSWORD");
-  const browser = await chromium.launch({ headless: true });
-  const page = await browser.newPage();
+  console.log("Launching Chromium with headless=false");
+
+  const browser = await chromium.launch({ headless: false });
+  const context = await browser.newContext();
+  const page = await context.newPage();
   let failure: unknown;
 
   try {
@@ -344,10 +383,15 @@ async function main(): Promise<void> {
     await deliverBill(pdfPath, delivery);
   } catch (error) {
     // Notify through the selected delivery method, then rethrow for cron/log visibility.
-    failure = error;
-    await deliverError(error, delivery);
+    const diagnostics = await savePageDiagnostics(page, "failure").catch(
+      (diagnosticError) => `Unable to save page diagnostics: ${getErrorMessage(diagnosticError)}`
+    );
+
+    failure = addErrorContext(error, diagnostics);
+    await deliverError(failure, delivery);
   } finally {
     await page.waitForTimeout(3000);
+    await context.close();
     await browser.close();
   }
 

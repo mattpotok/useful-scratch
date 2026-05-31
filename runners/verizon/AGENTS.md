@@ -55,6 +55,14 @@ Example cron shape:
 0 9 16 * * /home/pi/verizon/run.sh
 ```
 
+## Docker
+
+The Dockerfile uses a two-stage Playwright image build. Keep local-only secrets and generated files out of the image via `.dockerignore`.
+
+Build Raspberry Pi images with `docker buildx build --platform linux/arm64`. Use `--load` for a local image or `--output type=docker,dest=...` when copying the image to the Pi without a registry.
+
+Include `--ipc=host` in Playwright container run examples.
+
 ## Development Notes
 
 - Keep the Playwright selectors tied to accessible labels or stable IDs from the Verizon pages.

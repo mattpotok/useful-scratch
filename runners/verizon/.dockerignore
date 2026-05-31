@@ -1,7 +1,9 @@
-dist
 node_modules
-package-lock.json
+dist
+.env
 credentials.json
 token.json
-.env
+*.log
 *.tar
+Dockerfile
+.dockerignore
