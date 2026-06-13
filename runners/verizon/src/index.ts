@@ -1,17 +1,19 @@
 #!/usr/bin/env -S npx tsx
 
+import "dotenv/config";
 import { stdin as input, stdout as output } from "node:process";
 import { createInterface } from "node:readline/promises";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { appendFile, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { WebClient } from "@slack/web-api";
 import { Command, Option } from "commander";
 import { OAuth2Client } from "google-auth-library";
 import { google } from "googleapis";
 import open from "open";
-import { chromium, type Locator, type Page } from "playwright";
+import { chromium, type Browser, type BrowserContext, type Locator, type Page } from "playwright";
 
 const GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.send"];
 const PROJECT_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -27,6 +29,19 @@ type InstalledCredentials = {
 };
 
 type DeliveryMethod = "slack" | "email";
+
+type Logger = {
+  error(message: string): Promise<void>;
+  info(message: string): Promise<void>;
+  runDirectory: string;
+};
+
+interface DeliveryClient {
+  sendBill(pdfPath: string): Promise<void>;
+  sendError(error: unknown): Promise<void>;
+}
+
+let logger: Logger;
 
 function parseCliArgs(): { delivery: DeliveryMethod } {
   const program = new Command();
@@ -74,6 +89,19 @@ function getErrorMessage(error: unknown): string {
   return String(error);
 }
 
+async function withTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  timeoutMessage: string
+): Promise<T> {
+  return Promise.race([
+    promise,
+    delay(timeoutMs).then(() => {
+      throw new Error(timeoutMessage);
+    })
+  ]);
+}
+
 function addErrorContext(error: unknown, context: string): Error {
   const contextualError = new Error(error instanceof Error ? error.message : String(error));
 
@@ -87,9 +115,74 @@ function addErrorContext(error: unknown, context: string): Error {
   return contextualError;
 }
 
-async function savePageDiagnostics(page: Page, label: string): Promise<string> {
-  const diagnosticsBaseDirectory = process.env.VERIZON_DEBUG_DIR ?? tmpdir();
-  const diagnosticsDirectory = await mkdtemp(join(diagnosticsBaseDirectory, "verizon-debug-"));
+function formatTimestamp(date: Date): string {
+  const pad = (value: number) => String(value).padStart(2, "0");
+
+  return (
+    [date.getFullYear(), pad(date.getMonth() + 1), pad(date.getDate())].join("-") +
+    `-${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}`
+  );
+}
+
+function getDefaultLogRoot(): string {
+  const stateHome = process.env.XDG_STATE_HOME ?? join(homedir(), ".local", "state");
+  return join(stateHome, "runners", "verizon", "logs");
+}
+
+async function pruneOldRunDirectories(logRoot: string): Promise<void> {
+  const entries = await readdir(logRoot, { withFileTypes: true }).catch(() => []);
+  const oldRunDirectories = entries
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => entry.name)
+    .sort()
+    .reverse()
+    .slice(3);
+
+  await Promise.all(
+    oldRunDirectories.map((directoryName) =>
+      rm(join(logRoot, directoryName), { force: true, recursive: true })
+    )
+  );
+}
+
+async function createRunDirectory(): Promise<string> {
+  const logRoot = process.env.VERIZON_LOG_ROOT ?? getDefaultLogRoot();
+  const runDirectory = join(logRoot, formatTimestamp(new Date()));
+
+  await mkdir(runDirectory, { recursive: true });
+  await pruneOldRunDirectories(logRoot);
+
+  return runDirectory;
+}
+
+async function createLogger(): Promise<Logger> {
+  const runDirectory = await createRunDirectory();
+  const logPath = join(runDirectory, "output.log");
+
+  async function write(stream: NodeJS.WriteStream, message: string): Promise<void> {
+    const line = `${message}\n`;
+    stream.write(line);
+    await withTimeout(appendFile(logPath, line, "utf8"), 5000, "Timed out writing log file").catch(
+      (error: unknown) => {
+        stream.write(`Unable to write log file: ${getErrorMessage(error)}\n`);
+      }
+    );
+  }
+
+  return {
+    error: (message) => write(process.stderr, message),
+    info: (message) => write(process.stdout, message),
+    runDirectory
+  };
+}
+
+async function savePageDiagnostics(
+  page: Page,
+  label: string,
+  diagnosticsDirectory: string
+): Promise<string> {
+  await mkdir(diagnosticsDirectory, { recursive: true });
+
   const screenshotPath = join(diagnosticsDirectory, `${label}.png`);
   const htmlPath = join(diagnosticsDirectory, `${label}.html`);
   const title = await page.title().catch(() => "Unable to read page title");
@@ -118,8 +211,10 @@ async function openSignInPage(page: Page): Promise<Locator> {
 }
 
 async function submitPassword(page: Page, password: string): Promise<void> {
+  await logger.info("Waiting for password field.");
   await page.locator("#password").waitFor({ state: "visible" });
   await page.locator("#password").fill(password);
+  await logger.info("Submitting password.");
   await page.locator("#mvo-main-button").click();
 }
 
@@ -127,10 +222,12 @@ async function completePasswordOnlyFlow(page: Page, password: string): Promise<v
   const passwordOptionButton = getPasswordOptionButton(page);
 
   // Some sessions show a method picker before the password form.
+  await logger.info("Password-only flow detected; selecting password option.");
   await passwordOptionButton.waitFor({ state: "visible" });
   await passwordOptionButton.click();
   await submitPassword(page, password);
 
+  await logger.info("Waiting for dashboard after password-only login.");
   await page.getByRole("heading", { name: /^Hi,/ }).waitFor({
     state: "visible",
     timeout: 180000
@@ -144,12 +241,15 @@ async function completeVerificationFlow(page: Page, password: string): Promise<v
 
   // This path submits a password first, then waits for phone authorization.
   await submitPassword(page, password);
+  await logger.info("Selecting remember-verification option.");
   await rememberVerificationRadio.waitFor({ state: "visible" });
   await rememberVerificationRadio.check();
   await page.getByRole("button", { name: "Continue" }).click();
 
+  await logger.info("Waiting for phone authorization request.");
   await countdownHeading.waitFor({ state: "visible" });
 
+  await logger.info("Waiting for dashboard or expired verification.");
   const loginResult = await Promise.race([
     page
       .getByRole("heading", { name: /^Hi,/ })
@@ -164,6 +264,7 @@ async function completeVerificationFlow(page: Page, password: string): Promise<v
 }
 
 async function downloadLatestBill(page: Page): Promise<string> {
+  await logger.info("Opening Verizon bill details page.");
   await page.goto("https://www.verizon.com/digital/nsa/secure/ui/ngd/bill/billdetails", {
     waitUntil: "domcontentloaded"
   });
@@ -172,7 +273,9 @@ async function downloadLatestBill(page: Page): Promise<string> {
   const downloadDirectory = await mkdtemp(join(tmpdir(), "verizon-bill-"));
   const pdfPath = join(downloadDirectory, "latest-bill.pdf");
 
+  await logger.info("Waiting for Review Bill PDF link.");
   await reviewBillPdfButton.waitFor({ state: "visible" });
+  await logger.info("Opening Review Bill PDF.");
   await reviewBillPdfButton.click();
 
   // Verizon opens the PDF in a popup; fetch that URL with the same authenticated context.
@@ -188,7 +291,7 @@ async function downloadLatestBill(page: Page): Promise<string> {
   const pdfBuffer = Buffer.from(await response.body());
   await writeFile(pdfPath, pdfBuffer);
   await popupPage.close();
-  console.log(`Latest bill saved to: ${downloadDirectory}`);
+  await logger.info(`Latest bill saved to: ${downloadDirectory}`);
   return pdfPath;
 }
 
@@ -222,7 +325,7 @@ async function getGmailAuthClient() {
     access_type: "offline",
     scope: GMAIL_SCOPES
   });
-  console.log(`Authorize Gmail access: ${authUrl}`);
+  await logger.info(`Authorize Gmail access: ${authUrl}`);
   await open(authUrl);
 
   const readline = createInterface({ input, output });
@@ -236,113 +339,109 @@ async function getGmailAuthClient() {
   return authClient;
 }
 
-async function sendBillEmail(pdfPath: string, recipient: string): Promise<void> {
-  const auth = await getGmailAuthClient();
-  const gmail = google.gmail({ version: "v1", auth });
-  const pdfBuffer = await readFile(pdfPath);
-  const boundary = `verizon-bill-${Date.now()}`;
-  const message = [
-    `To: ${recipient}`,
-    "Subject: Latest Verizon bill",
-    "MIME-Version: 1.0",
-    `Content-Type: multipart/mixed; boundary="${boundary}"`,
-    "",
-    `--${boundary}`,
-    "Content-Type: text/plain; charset=utf-8",
-    "",
-    "Attached is the latest Verizon bill PDF.",
-    "",
-    `--${boundary}`,
-    "Content-Type: application/pdf",
-    'Content-Disposition: attachment; filename="latest-bill.pdf"',
-    "Content-Transfer-Encoding: base64",
-    "",
-    pdfBuffer.toString("base64"),
-    "",
-    `--${boundary}--`
-  ].join("\r\n");
+class EmailDeliveryClient implements DeliveryClient {
+  readonly #recipient = getRequiredEnvVar("EMAIL_TO");
 
-  await gmail.users.messages.send({
-    userId: "me",
-    requestBody: {
-      raw: base64UrlEncode(message)
-    }
-  });
+  async sendBill(pdfPath: string): Promise<void> {
+    const auth = await getGmailAuthClient();
+    const gmail = google.gmail({ version: "v1", auth });
+    const pdfBuffer = await readFile(pdfPath);
+    const boundary = `verizon-bill-${Date.now()}`;
+    const message = [
+      `To: ${this.#recipient}`,
+      "Subject: Latest Verizon bill",
+      "MIME-Version: 1.0",
+      `Content-Type: multipart/mixed; boundary="${boundary}"`,
+      "",
+      `--${boundary}`,
+      "Content-Type: text/plain; charset=utf-8",
+      "",
+      "Attached is the latest Verizon bill PDF.",
+      "",
+      `--${boundary}`,
+      "Content-Type: application/pdf",
+      'Content-Disposition: attachment; filename="latest-bill.pdf"',
+      "Content-Transfer-Encoding: base64",
+      "",
+      pdfBuffer.toString("base64"),
+      "",
+      `--${boundary}--`
+    ].join("\r\n");
 
-  console.log(`Latest bill emailed to: ${recipient}`);
-}
+    await gmail.users.messages.send({
+      userId: "me",
+      requestBody: {
+        raw: base64UrlEncode(message)
+      }
+    });
 
-async function sendErrorEmail(error: unknown, recipient: string): Promise<void> {
-  const auth = await getGmailAuthClient();
-  const gmail = google.gmail({ version: "v1", auth });
-  const message = [
-    `To: ${recipient}`,
-    "Subject: Verizon bill runner failed",
-    "MIME-Version: 1.0",
-    "Content-Type: text/plain; charset=utf-8",
-    "",
-    getErrorMessage(error)
-  ].join("\r\n");
+    await logger.info(`Latest bill emailed to: ${this.#recipient}`);
+  }
 
-  await gmail.users.messages.send({
-    userId: "me",
-    requestBody: {
-      raw: base64UrlEncode(message)
-    }
-  });
+  async sendError(error: unknown): Promise<void> {
+    const auth = await getGmailAuthClient();
+    const gmail = google.gmail({ version: "v1", auth });
+    const message = [
+      `To: ${this.#recipient}`,
+      "Subject: Verizon bill runner failed",
+      "MIME-Version: 1.0",
+      "Content-Type: text/plain; charset=utf-8",
+      "",
+      getErrorMessage(error)
+    ].join("\r\n");
 
-  console.log(`Failure notification emailed to: ${recipient}`);
-}
+    await gmail.users.messages.send({
+      userId: "me",
+      requestBody: {
+        raw: base64UrlEncode(message)
+      }
+    });
 
-async function uploadBillToSlack(pdfPath: string): Promise<void> {
-  const slackToken = getRequiredEnvVar("SLACK_BOT_TOKEN");
-  const slackChannelId = getRequiredEnvVar("SLACK_CHANNEL_ID");
-  const slack = new WebClient(slackToken);
-  const pdfBuffer = await readFile(pdfPath);
-
-  await slack.files.uploadV2({
-    channel_id: slackChannelId,
-    file: pdfBuffer,
-    filename: "latest-verizon-bill.pdf",
-    title: "Latest Verizon bill",
-    initial_comment: "Latest Verizon bill PDF"
-  });
-
-  console.log(`Latest bill uploaded to Slack channel: ${slackChannelId}`);
-}
-
-async function sendErrorToSlack(error: unknown): Promise<void> {
-  const slackToken = getRequiredEnvVar("SLACK_BOT_TOKEN");
-  const slackChannelId = getRequiredEnvVar("SLACK_CHANNEL_ID");
-  const slack = new WebClient(slackToken);
-
-  await slack.chat.postMessage({
-    channel: slackChannelId,
-    text: `Verizon bill runner failed:\n\`\`\`${getErrorMessage(error)}\`\`\``
-  });
-
-  console.log(`Failure notification sent to Slack channel: ${slackChannelId}`);
-}
-
-async function deliverBill(pdfPath: string, delivery: DeliveryMethod): Promise<void> {
-  if (delivery === "slack") {
-    await uploadBillToSlack(pdfPath);
-  } else {
-    await sendBillEmail(pdfPath, getRequiredEnvVar("EMAIL_TO"));
+    await logger.info(`Failure notification emailed to: ${this.#recipient}`);
   }
 }
 
-async function deliverError(error: unknown, delivery: DeliveryMethod): Promise<void> {
-  if (delivery === "slack") {
-    await sendErrorToSlack(error);
-  } else {
-    await sendErrorEmail(error, getRequiredEnvVar("EMAIL_TO"));
+class SlackDeliveryClient implements DeliveryClient {
+  readonly #channelId = getRequiredEnvVar("SLACK_CHANNEL_ID");
+  readonly #slack = new WebClient(getRequiredEnvVar("SLACK_BOT_TOKEN"));
+
+  async sendBill(pdfPath: string): Promise<void> {
+    const pdfBuffer = await readFile(pdfPath);
+
+    await this.#slack.files.uploadV2({
+      channel_id: this.#channelId,
+      file: pdfBuffer,
+      filename: "latest-verizon-bill.pdf",
+      title: "Latest Verizon bill",
+      initial_comment: "Latest Verizon bill PDF"
+    });
+
+    await logger.info(`Latest bill uploaded to Slack channel: ${this.#channelId}`);
   }
+
+  async sendError(error: unknown): Promise<void> {
+    await this.#slack.chat.postMessage({
+      channel: this.#channelId,
+      text: `Verizon bill runner failed:\n\`\`\`${getErrorMessage(error)}\`\`\``
+    });
+
+    await logger.info(`Failure notification sent to Slack channel: ${this.#channelId}`);
+  }
+}
+
+function createDeliveryClient(delivery: DeliveryMethod): DeliveryClient {
+  if (delivery === "slack") {
+    return new SlackDeliveryClient();
+  }
+
+  return new EmailDeliveryClient();
 }
 
 async function login(page: Page, username: string, password: string): Promise<void> {
+  await logger.info("Opening Verizon sign-in page.");
   const usernameField = await openSignInPage(page);
 
+  await logger.info("Submitting username.");
   await usernameField.fill(username);
   await page.locator("#mvo-main-button").click();
 
@@ -356,6 +455,8 @@ async function login(page: Page, username: string, password: string): Promise<vo
     passwordField.waitFor({ state: "visible", timeout: 10000 }).then(() => "verification" as const)
   ]).catch(() => null);
 
+  await logger.info(`Detected Verizon login flow: ${nextStep ?? "unknown"}.`);
+
   if (nextStep === "password-only") {
     await completePasswordOnlyFlow(page, password);
   } else if (nextStep === "verification") {
@@ -367,37 +468,57 @@ async function login(page: Page, username: string, password: string): Promise<vo
 
 async function main(): Promise<void> {
   const { delivery } = parseCliArgs();
-
-  const username = getRequiredEnvVar("VERIZON_USERNAME");
-  const password = getRequiredEnvVar("VERIZON_PASSWORD");
-  console.log("Launching Chromium with headless=false");
-
-  const browser = await chromium.launch({ headless: false });
-  const context = await browser.newContext();
-  const page = await context.newPage();
+  logger = await createLogger();
+  let deliveryClient: DeliveryClient | undefined;
+  let browser: Browser | undefined;
+  let context: BrowserContext | undefined;
+  let page: Page | undefined;
   let failure: unknown;
 
   try {
+    await logger.info(`Run directory: ${logger.runDirectory}`);
+
+    const username = getRequiredEnvVar("VERIZON_USERNAME");
+    const password = getRequiredEnvVar("VERIZON_PASSWORD");
+    deliveryClient = createDeliveryClient(delivery);
+
+    await logger.info("Launching Chromium with headless=false");
+    browser = await chromium.launch({ headless: false });
+    context = await browser.newContext();
+    page = await context.newPage();
+
     await login(page, username, password);
     const pdfPath = await downloadLatestBill(page);
-    await deliverBill(pdfPath, delivery);
+    await deliveryClient.sendBill(pdfPath);
   } catch (error) {
-    // Notify through the selected delivery method, then rethrow for cron/log visibility.
-    const diagnostics = await savePageDiagnostics(page, "failure").catch(
-      (diagnosticError) => `Unable to save page diagnostics: ${getErrorMessage(diagnosticError)}`
-    );
+    // Notify through the selected delivery method, then exit nonzero for cron visibility.
+    const diagnostics = page
+      ? await savePageDiagnostics(page, "failure", logger.runDirectory).catch(
+          (diagnosticError) =>
+            `Unable to save page diagnostics: ${getErrorMessage(diagnosticError)}`
+        )
+      : `Diagnostics unavailable because the browser page was not created.\nRun directory: ${logger.runDirectory}`;
 
     failure = addErrorContext(error, diagnostics);
-    await deliverError(failure, delivery);
+    await deliveryClient
+      ?.sendError(failure)
+      .catch((deliveryError: unknown) =>
+        logger.error(`Unable to deliver failure notification: ${getErrorMessage(deliveryError)}`)
+      );
+    await logger.error(getErrorMessage(failure));
+    process.exitCode = 1;
   } finally {
-    await page.waitForTimeout(3000);
-    await context.close();
-    await browser.close();
+    await page?.waitForTimeout(3000).catch(() => undefined);
+    await context?.close().catch(() => undefined);
+    await browser?.close().catch(() => undefined);
   }
 
   if (failure) {
-    throw failure;
+    return;
   }
 }
 
-await main();
+await main().catch((error: unknown) => {
+  console.error(getErrorMessage(error));
+  process.exitCode = 1;
+});

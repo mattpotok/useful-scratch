@@ -26,16 +26,14 @@ npm run build
 
 ## Configuration
 
-Create a local `.env` file in this directory. This file is loaded by `run.sh` and is ignored by git.
+Create a local `.env` file in this directory. This file is loaded by Docker and by native Node runs, and is ignored by git.
 
-```bash
-VERIZON_USERNAME='your-verizon-user-id'
-VERIZON_PASSWORD='your-verizon-password'
-SLACK_BOT_TOKEN='xoxb-...'
-SLACK_CHANNEL_ID='C...'
-EMAIL_TO='recipient@example.com'
-# Optional. Defaults to verizon-runner:latest.
-DOCKER_IMAGE='verizon-runner:latest'
+```env
+VERIZON_USERNAME=your-verizon-user-id
+VERIZON_PASSWORD=your-verizon-password
+SLACK_BOT_TOKEN=xoxb-...
+SLACK_CHANNEL_ID=C...
+EMAIL_TO=recipient@example.com
 ```
 
 Slack delivery requires `SLACK_BOT_TOKEN` and `SLACK_CHANNEL_ID`.
@@ -49,24 +47,13 @@ Keep `.env`, `credentials.json`, and `token.json` out of git.
 
 ## Running
 
-The normal entrypoint is:
+The normal deployment entrypoint runs the Docker image:
 
 ```bash
-./run.sh native
+./run.sh
 ```
 
-`run.sh` requires an explicit execution mode:
-
-- `native` loads `.env`, builds the project locally, and runs Slack delivery with host Node.
-- `docker` loads `.env`, runs Slack delivery with the Docker image, and does not rebuild the image.
-
-Native mode runs:
-
-```bash
-npm run start -- --delivery slack
-```
-
-To run manually with Slack:
+For native development, build the project and pass an explicit delivery method:
 
 ```bash
 npm run build
@@ -82,23 +69,33 @@ npm run start -- --delivery email
 
 The `--delivery` argument is required and must be either `slack` or `email`.
 
+`run.sh` always runs Slack delivery through Docker and defaults to `verizon-runner:latest`.
+Use `DOCKER_IMAGE` as a shell override to choose a different image tag:
+
+```bash
+DOCKER_IMAGE=verizon-runner:latest ./run.sh
+```
+
 ## Logs
 
-`run.sh` writes each execution to a timestamped run directory under:
+The runner writes each execution to a timestamped run directory under:
 
 ```bash
 ${XDG_STATE_HOME:-$HOME/.local/state}/runners/verizon/logs
 ```
 
+Set `VERIZON_LOG_ROOT` to override the root log directory.
+
 Each run directory contains:
 
 - `output.log` for terminal output
-- `debug/` for failure screenshots and HTML snapshots
+- `failure.html` for the saved failure page
+- `failure.png` for the saved failure screenshot, when screenshot capture succeeds
 
-Output is also mirrored to the terminal.
+Runner output is also mirrored to the terminal.
 
-The script keeps the current run directory plus the two most recent prior run directories.
-Docker runs the container with the host UID/GID so diagnostic files remain readable by the current user.
+The runner keeps the current run directory plus the two most recent prior run directories.
+Docker mounts the host log root into the container and runs with the host UID/GID so diagnostic files remain readable by the current user.
 
 ## Verification
 
@@ -149,7 +146,7 @@ Use the tag that matches the image you built:
 Run with Slack delivery:
 
 ```bash
-DOCKER_IMAGE='verizon-runner:<tag>' ./run.sh docker
+DOCKER_IMAGE=verizon-runner:<tag> ./run.sh
 ```
 
 Mount local Gmail OAuth files when using email delivery:
@@ -158,6 +155,8 @@ Mount local Gmail OAuth files when using email delivery:
 docker run --rm \
   --ipc=host \
   --env-file .env \
+  -e VERIZON_LOG_ROOT=/logs \
+  -v "${XDG_STATE_HOME:-$HOME/.local/state}/runners/verizon/logs:/logs" \
   -v "$PWD/credentials.json:/app/credentials.json:ro" \
   -v "$PWD/token.json:/app/token.json" \
   verizon-runner:<tag> node --enable-source-maps dist/index.js --delivery email
@@ -166,7 +165,7 @@ docker run --rm \
 On the Pi, replace `<tag>` with the image tag you loaded and schedule that image instead of rebuilding it:
 
 ```cron
-14 15 20 * * cd /home/pi/verizon && DOCKER_IMAGE='verizon-runner:<tag>' ./run.sh docker
+14 15 20 * * cd /home/pi/verizon && DOCKER_IMAGE=verizon-runner:<tag> ./run.sh
 ```
 
 Adjust the day and time based on when the bill is reliably available.
