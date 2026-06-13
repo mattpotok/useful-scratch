@@ -15,6 +15,7 @@ docker run \
   --ipc=host \
   --env-file .env \
   --env VERIZON_LOG_ROOT=/logs \
+  --env HOME=/tmp \
   --user "$(id -u):$(id -g)" \
   --volume "$LOG_ROOT:/logs" \
   "$docker_image"
