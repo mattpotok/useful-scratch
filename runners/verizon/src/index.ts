@@ -6,7 +6,6 @@ import { createInterface } from "node:readline/promises";
 import { appendFile, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { WebClient } from "@slack/web-api";
 import { Command, Option } from "commander";
@@ -41,7 +40,15 @@ interface DeliveryClient {
   sendError(error: unknown): Promise<void>;
 }
 
-let logger: Logger;
+let logger: Logger = {
+  error: async (message) => {
+    process.stderr.write(`${message}\n`);
+  },
+  info: async (message) => {
+    process.stdout.write(`${message}\n`);
+  },
+  runDirectory: ""
+};
 
 function parseCliArgs(): { delivery: DeliveryMethod } {
   const program = new Command();
@@ -60,7 +67,7 @@ function parseCliArgs(): { delivery: DeliveryMethod } {
 }
 
 function getRequiredEnvVar(name: string): string {
-  const value = process.env[name];
+  const value = process.env[name]?.trim();
 
   if (!value) {
     throw new Error(`Missing ${name} environment variable.`);
@@ -89,17 +96,29 @@ function getErrorMessage(error: unknown): string {
   return String(error);
 }
 
+function isPdfBuffer(buffer: Buffer): boolean {
+  return buffer.subarray(0, 4).toString("ascii") === "%PDF";
+}
+
 async function withTimeout<T>(
   promise: Promise<T>,
   timeoutMs: number,
   timeoutMessage: string
 ): Promise<T> {
-  return Promise.race([
-    promise,
-    delay(timeoutMs).then(() => {
-      throw new Error(timeoutMessage);
-    })
-  ]);
+  let timeout: NodeJS.Timeout | undefined;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timeout = setTimeout(() => {
+      reject(new Error(timeoutMessage));
+    }, timeoutMs);
+  });
+
+  try {
+    return await Promise.race([promise, timeoutPromise]);
+  } finally {
+    if (timeout) {
+      clearTimeout(timeout);
+    }
+  }
 }
 
 function addErrorContext(error: unknown, context: string): Error {
@@ -132,16 +151,22 @@ function getDefaultLogRoot(): string {
 async function pruneOldRunDirectories(logRoot: string): Promise<void> {
   const entries = await readdir(logRoot, { withFileTypes: true }).catch(() => []);
   const oldRunDirectories = entries
-    .filter((entry) => entry.isDirectory())
+    .filter((entry) => entry.isDirectory() && /^\d{4}-\d{2}-\d{2}-\d{6}$/.test(entry.name))
     .map((entry) => entry.name)
     .sort()
     .reverse()
     .slice(3);
 
   await Promise.all(
-    oldRunDirectories.map((directoryName) =>
-      rm(join(logRoot, directoryName), { force: true, recursive: true })
-    )
+    oldRunDirectories.map(async (directoryName) => {
+      await rm(join(logRoot, directoryName), { force: true, recursive: true }).catch(
+        (error: unknown) => {
+          process.stderr.write(
+            `Unable to prune old run directory ${directoryName}: ${getErrorMessage(error)}\n`
+          );
+        }
+      );
+    })
   );
 }
 
@@ -186,17 +211,32 @@ async function savePageDiagnostics(
   const screenshotPath = join(diagnosticsDirectory, `${label}.png`);
   const htmlPath = join(diagnosticsDirectory, `${label}.html`);
   const title = await page.title().catch(() => "Unable to read page title");
-
-  await page.screenshot({ path: screenshotPath, fullPage: true }).catch(() => undefined);
-  await writeFile(htmlPath, await page.content(), "utf8").catch(() => undefined);
-
-  return [
+  const diagnosticLines = [
     `Diagnostics saved to: ${diagnosticsDirectory}`,
     `Current URL: ${page.url()}`,
-    `Page title: ${title}`,
-    `Screenshot: ${screenshotPath}`,
-    `HTML: ${htmlPath}`
-  ].join("\n");
+    `Page title: ${title}`
+  ];
+
+  await page
+    .screenshot({ path: screenshotPath, fullPage: true, timeout: 10000 })
+    .then(() => {
+      diagnosticLines.push(`Screenshot: ${screenshotPath}`);
+    })
+    .catch((error: unknown) => {
+      diagnosticLines.push(`Screenshot failed: ${getErrorMessage(error)}`);
+    });
+
+  await page
+    .content()
+    .then((content) => writeFile(htmlPath, content, "utf8"))
+    .then(() => {
+      diagnosticLines.push(`HTML: ${htmlPath}`);
+    })
+    .catch((error: unknown) => {
+      diagnosticLines.push(`HTML capture failed: ${getErrorMessage(error)}`);
+    });
+
+  return diagnosticLines.join("\n");
 }
 
 async function openSignInPage(page: Page): Promise<Locator> {
@@ -276,21 +316,37 @@ async function downloadLatestBill(page: Page): Promise<string> {
   await logger.info("Waiting for Review Bill PDF link.");
   await reviewBillPdfButton.waitFor({ state: "visible" });
   await logger.info("Opening Review Bill PDF.");
+  const popupPromise = page.context().waitForEvent("page", { timeout: 10000 });
   await reviewBillPdfButton.click();
 
   // Verizon opens the PDF in a popup; fetch that URL with the same authenticated context.
-  const popupPromise = page.context().waitForEvent("page", { timeout: 10000 });
   const popupPage = await popupPromise;
-  await popupPage.waitForLoadState("domcontentloaded");
 
-  const response = await page.context().request.get(popupPage.url());
-  if (!response.ok()) {
-    throw new Error(`Unable to download bill PDF from ${popupPage.url()}.`);
+  try {
+    await popupPage.waitForURL(
+      (url) => url.hostname.endsWith("verizon.com") && url.pathname.endsWith("/bill_pdfdoc"),
+      { timeout: 15000 }
+    );
+
+    const pdfUrl = popupPage.url();
+    const response = await page.context().request.get(pdfUrl);
+    if (!response.ok()) {
+      throw new Error(`Unable to download bill PDF from ${pdfUrl}.`);
+    }
+
+    const pdfBuffer = Buffer.from(await response.body());
+    const contentType = response.headers()["content-type"] ?? "";
+    if (!contentType.toLowerCase().includes("application/pdf") && !isPdfBuffer(pdfBuffer)) {
+      throw new Error(
+        `Expected Verizon bill PDF from ${pdfUrl}, received ${contentType || "unknown content type"}.`
+      );
+    }
+
+    await writeFile(pdfPath, pdfBuffer);
+  } finally {
+    await popupPage.close().catch(() => undefined);
   }
 
-  const pdfBuffer = Buffer.from(await response.body());
-  await writeFile(pdfPath, pdfBuffer);
-  await popupPage.close();
   await logger.info(`Latest bill saved to: ${downloadDirectory}`);
   return pdfPath;
 }
@@ -326,6 +382,13 @@ async function getGmailAuthClient() {
     scope: GMAIL_SCOPES
   });
   await logger.info(`Authorize Gmail access: ${authUrl}`);
+
+  if (!input.isTTY) {
+    throw new Error(
+      "Gmail OAuth token.json is missing or expired, but this process has no interactive TTY. Regenerate token.json from a local terminal before using email delivery in Docker or cron."
+    );
+  }
+
   await open(authUrl);
 
   const readline = createInterface({ input, output });
@@ -468,19 +531,18 @@ async function login(page: Page, username: string, password: string): Promise<vo
 
 async function main(): Promise<void> {
   const { delivery } = parseCliArgs();
-  logger = await createLogger();
   let deliveryClient: DeliveryClient | undefined;
   let browser: Browser | undefined;
   let context: BrowserContext | undefined;
   let page: Page | undefined;
-  let failure: unknown;
 
   try {
+    deliveryClient = createDeliveryClient(delivery);
+    logger = await createLogger();
     await logger.info(`Run directory: ${logger.runDirectory}`);
 
     const username = getRequiredEnvVar("VERIZON_USERNAME");
     const password = getRequiredEnvVar("VERIZON_PASSWORD");
-    deliveryClient = createDeliveryClient(delivery);
 
     await logger.info("Launching Chromium with headless=false");
     browser = await chromium.launch({ headless: false });
@@ -499,7 +561,7 @@ async function main(): Promise<void> {
         )
       : `Diagnostics unavailable because the browser page was not created.\nRun directory: ${logger.runDirectory}`;
 
-    failure = addErrorContext(error, diagnostics);
+    const failure = addErrorContext(error, diagnostics);
     await deliveryClient
       ?.sendError(failure)
       .catch((deliveryError: unknown) =>
@@ -508,13 +570,8 @@ async function main(): Promise<void> {
     await logger.error(getErrorMessage(failure));
     process.exitCode = 1;
   } finally {
-    await page?.waitForTimeout(3000).catch(() => undefined);
     await context?.close().catch(() => undefined);
     await browser?.close().catch(() => undefined);
-  }
-
-  if (failure) {
-    return;
   }
 }
 

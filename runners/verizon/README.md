@@ -27,6 +27,7 @@ npm run build
 ## Configuration
 
 Create a local `.env` file in this directory. This file is loaded by Docker and by native Node runs, and is ignored by git.
+Use simple unquoted `KEY=value` lines. Docker's `--env-file` parser does not strip shell-style quotes or expand `${VAR}` references.
 
 ```env
 VERIZON_USERNAME=your-verizon-user-id
@@ -43,15 +44,13 @@ Email delivery requires `EMAIL_TO`, plus local Gmail OAuth files:
 - `credentials.json`
 - `token.json`
 
+Generate or refresh `token.json` from an interactive local terminal before using email delivery in Docker or cron.
+
 Keep `.env`, `credentials.json`, and `token.json` out of git.
 
 ## Running
 
-The normal deployment entrypoint runs the Docker image:
-
-```bash
-./run.sh
-```
+The `--delivery` argument is required and must be either `slack` or `email`.
 
 For native development, build the project and pass an explicit delivery method:
 
@@ -60,20 +59,10 @@ npm run build
 npm run start -- --delivery slack
 ```
 
-To run manually with email:
+Use email delivery by changing the argument:
 
 ```bash
-npm run build
 npm run start -- --delivery email
-```
-
-The `--delivery` argument is required and must be either `slack` or `email`.
-
-`run.sh` always runs Slack delivery through Docker and defaults to `verizon-runner:latest`.
-Use `DOCKER_IMAGE` as a shell override to choose a different image tag:
-
-```bash
-DOCKER_IMAGE=verizon-runner:latest ./run.sh
 ```
 
 ## Logs
@@ -108,12 +97,6 @@ npm run check
 npm run build
 ```
 
-## Raspberry Pi
-
-The recommended Raspberry Pi deployment is Docker. Build the ARM64 image on a faster machine, copy or load it onto the Pi, and schedule `docker run` with cron.
-
-Native Node setup is possible, but `npm ci`, Playwright installation, and TypeScript builds are slower and more memory-sensitive on the Pi.
-
 ## Docker
 
 The Docker image uses a two-stage build. The build stage installs dev dependencies and compiles TypeScript. The runtime stage installs production dependencies only and runs the compiled output.
@@ -128,12 +111,12 @@ Build for the current machine and tag it as `latest`:
 docker build -t verizon-runner:latest .
 ```
 
-Cross-build for a 64-bit Raspberry Pi and export the image for copying without a registry:
+Cross-build for an ARM64 Linux host and export the image for copying without a registry:
 
 ```bash
-docker buildx build --platform linux/arm64 -t verizon-runner:pi --output type=docker,dest=verizon-runner-pi.tar .
-scp verizon-runner-pi.tar pi@raspberrypi:~
-ssh pi@raspberrypi 'docker load -i verizon-runner-pi.tar'
+docker buildx build --platform linux/arm64 -t verizon-runner:arm64 --output type=docker,dest=verizon-runner-arm64.tar .
+scp verizon-runner-arm64.tar user@remote-host:~
+ssh user@remote-host 'docker load -i verizon-runner-arm64.tar'
 ```
 
 ### Running
@@ -141,9 +124,15 @@ ssh pi@raspberrypi 'docker load -i verizon-runner-pi.tar'
 Use the tag that matches the image you built:
 
 - `verizon-runner:latest` for a local/native image
-- `verizon-runner:pi` for the Raspberry Pi ARM64 image
+- `verizon-runner:arm64` for a cross-built ARM64 image
 
-Run with Slack delivery:
+The normal deployment entrypoint is Docker via `run.sh`. It runs Slack delivery and defaults to `verizon-runner:latest`:
+
+```bash
+./run.sh
+```
+
+Use `DOCKER_IMAGE` to choose a different image tag:
 
 ```bash
 DOCKER_IMAGE=verizon-runner:<tag> ./run.sh
@@ -162,10 +151,10 @@ docker run --rm \
   verizon-runner:<tag> node --enable-source-maps dist/index.js --delivery email
 ```
 
-On the Pi, replace `<tag>` with the image tag you loaded and schedule that image instead of rebuilding it:
+On the remote host, replace `<tag>` with the image tag you loaded and schedule that image instead of rebuilding it:
 
 ```cron
-14 15 20 * * cd /home/pi/verizon && DOCKER_IMAGE=verizon-runner:<tag> ./run.sh
+<minute> <hour> <day-of-month> * * cd /path/to/verizon && DOCKER_IMAGE=verizon-runner:<tag> ./run.sh
 ```
 
 Adjust the day and time based on when the bill is reliably available.
